@@ -68,3 +68,18 @@ class BufferedSocketReader:
         result = self._buf[:n]
         self._buf = self._buf[n:]
         return result
+
+    def drain_buffered(self) -> bytes:
+        """Returns and clears any bytes already read into the internal
+        buffer but not yet consumed.
+
+        Needed when handing a raw socket off to a different protocol after
+        HTTP parsing -- e.g. a WebSocket upgrade. If a client sent its first
+        WebSocket frame in the same TCP segment as the upgrade request (or
+        the OS just happened to deliver them together), those extra bytes
+        are sitting in this buffer, not on the wire -- reading straight from
+        the socket after handoff would silently skip them.
+        """
+        result = self._buf
+        self._buf = b""
+        return result

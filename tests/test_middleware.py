@@ -1,4 +1,12 @@
-from http_server.middleware import access_log_middleware, apply_middleware, cors_middleware, gzip_middleware
+import time
+
+from http_server.middleware import (
+    access_log_middleware,
+    apply_middleware,
+    cors_middleware,
+    gzip_middleware,
+    rate_limit_middleware,
+)
 from http_server.parser import HTTPRequest
 from http_server.response import HTTPResponse, make_response
 
@@ -165,3 +173,60 @@ def test_cors_answers_preflight_without_calling_the_handler():
     assert called == []
     assert resp.status_code == 204
     assert "Access-Control-Allow-Origin" in resp.headers
+
+
+# --- rate_limit_middleware ---
+
+
+def test_rate_limit_allows_requests_under_the_cap():
+    def base(req):
+        return make_response(200, b"ok")
+
+    handler = rate_limit_middleware(max_requests=3, window_seconds=60)(base)
+    req = make_req(client_addr=("1.2.3.4", 1111))
+
+    for _ in range(3):
+        resp = handler(req)
+        assert resp.status_code == 200
+
+
+def test_rate_limit_rejects_requests_over_the_cap_with_429():
+    def base(req):
+        return make_response(200, b"ok")
+
+    handler = rate_limit_middleware(max_requests=3, window_seconds=60)(base)
+    req = make_req(client_addr=("1.2.3.4", 1111))
+
+    for _ in range(3):
+        handler(req)
+
+    resp = handler(req)
+    assert resp.status_code == 429
+    assert "Retry-After" in resp.headers
+
+
+def test_rate_limit_tracks_ips_independently():
+    def base(req):
+        return make_response(200, b"ok")
+
+    handler = rate_limit_middleware(max_requests=1, window_seconds=60)(base)
+    req_a = make_req(client_addr=("1.1.1.1", 1))
+    req_b = make_req(client_addr=("2.2.2.2", 2))
+
+    assert handler(req_a).status_code == 200
+    assert handler(req_a).status_code == 429  # A is now over its own limit
+    assert handler(req_b).status_code == 200  # B is unaffected by A's usage
+
+
+def test_rate_limit_window_resets_after_time_passes():
+    def base(req):
+        return make_response(200, b"ok")
+
+    handler = rate_limit_middleware(max_requests=1, window_seconds=0.2)(base)
+    req = make_req(client_addr=("3.3.3.3", 3))
+
+    assert handler(req).status_code == 200
+    assert handler(req).status_code == 429
+
+    time.sleep(0.25)
+    assert handler(req).status_code == 200  # window has slid past the old request

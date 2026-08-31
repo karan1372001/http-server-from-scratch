@@ -10,11 +10,18 @@ from pathlib import Path
 
 from http_server.body_parser import BodyParseError, parse_body
 from http_server.errors import error_page
-from http_server.middleware import access_log_middleware, apply_middleware, cors_middleware, gzip_middleware
+from http_server.middleware import (
+    access_log_middleware,
+    apply_middleware,
+    cors_middleware,
+    gzip_middleware,
+    rate_limit_middleware,
+)
 from http_server.parser import HTTPRequest
 from http_server.response import HTTPResponse, make_response
 from http_server.router import Router
 from http_server.static_files import serve_static_file
+from http_server.websocket import WebSocketConnection
 
 router = Router()
 
@@ -102,7 +109,22 @@ def slow(req: HTTPRequest) -> HTTPResponse:
     return make_response(200, b"Slow response after ~100ms\n", {"Content-Type": "text/plain"})
 
 
+@router.websocket("/ws/echo")
+def ws_echo(conn: WebSocketConnection, req: HTTPRequest) -> None:
+    """Echoes every text message back, prefixed, until the client disconnects.
+
+    Connect with any WebSocket client at ws://host:port/ws/echo, e.g. in a
+    browser console: `new WebSocket("ws://127.0.0.1:8080/ws/echo")`.
+    """
+    conn.send_text("connected -- send me anything")
+    while True:
+        message = conn.receive()
+        if message is None:
+            return  # client disconnected (or sent Close)
+        conn.send_text(f"echo: {message}")
+
+
 app_handler = apply_middleware(
     router.as_handler(),
-    [access_log_middleware(), cors_middleware(), gzip_middleware()],
+    [access_log_middleware(), cors_middleware(), rate_limit_middleware(max_requests=300, window_seconds=60), gzip_middleware()],
 )

@@ -27,9 +27,10 @@ from __future__ import annotations
 import socket
 import ssl
 import threading
-from typing import Optional
+from typing import Dict, Optional
 
 from .connection import Handler, handle_connection
+from .websocket import WSHandler
 
 TLS_HANDSHAKE_TIMEOUT_SECONDS = 10
 
@@ -42,6 +43,7 @@ class HTTPServer:
         handler: Optional[Handler] = None,
         poll_interval: float = 0.5,
         ssl_context: Optional[ssl.SSLContext] = None,
+        ws_routes: Optional[Dict[str, WSHandler]] = None,
     ):
         if handler is None:
             raise ValueError("HTTPServer requires a handler function")
@@ -50,6 +52,7 @@ class HTTPServer:
         self.handler = handler
         self.poll_interval = poll_interval
         self.ssl_context = ssl_context
+        self.ws_routes = ws_routes
         self._sock: Optional[socket.socket] = None
         self._stop_event = threading.Event()
 
@@ -87,7 +90,7 @@ class HTTPServer:
 
                 # handle_connection sets its own timeout on `conn` immediately,
                 # so it doesn't inherit this short listening-socket timeout.
-                handle_connection(conn, addr, self.handler)
+                handle_connection(conn, addr, self.handler, ws_routes=self.ws_routes)
         finally:
             try:
                 sock.close()

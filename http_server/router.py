@@ -19,6 +19,7 @@ from typing import Callable, Dict, List, Optional, Pattern, Tuple
 from .errors import error_page
 from .parser import HTTPRequest
 from .response import HTTPResponse
+from .websocket import WSHandler
 
 RouteHandler = Callable[[HTTPRequest], HTTPResponse]
 
@@ -53,6 +54,24 @@ class _Route:
 class Router:
     def __init__(self):
         self._routes: List[_Route] = []
+        self._ws_routes: Dict[str, WSHandler] = {}
+
+    def websocket(self, path: str):
+        """Registers a WebSocket handler at an exact path (no path params --
+        WebSocket endpoints are typically few and simple; keeping this
+        exact-match-only avoids needing to thread the regex router through
+        a completely different connection-handling flow for little benefit).
+        """
+
+        def decorator(handler: WSHandler) -> WSHandler:
+            self._ws_routes[path] = handler
+            return handler
+
+        return decorator
+
+    @property
+    def ws_routes(self) -> Dict[str, WSHandler]:
+        return self._ws_routes
 
     def add_route(self, method: str, path_pattern: str, handler: RouteHandler) -> None:
         self._routes.append(_Route(method.upper(), _compile_path(path_pattern), handler, path_pattern))

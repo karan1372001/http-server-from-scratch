@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional
 
 STATUS_MESSAGES: Dict[int, str] = {
+    101: "Switching Protocols",
     200: "OK",
     201: "Created",
     204: "No Content",
@@ -21,9 +22,11 @@ STATUS_MESSAGES: Dict[int, str] = {
     413: "Payload Too Large",
     414: "URI Too Long",
     416: "Range Not Satisfiable",
+    429: "Too Many Requests",
     431: "Request Header Fields Too Large",
     500: "Internal Server Error",
     501: "Not Implemented",
+    502: "Bad Gateway",
     505: "HTTP Version Not Supported",
 }
 

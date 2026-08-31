@@ -10,8 +10,10 @@ first and the response last.
 from __future__ import annotations
 
 import gzip as gzip_module
+import threading
 import time
-from typing import Callable, List
+from collections import defaultdict, deque
+from typing import Callable, Deque, Dict, List
 
 from .parser import HTTPRequest
 from .response import HTTPResponse
@@ -124,6 +126,49 @@ def cors_middleware(
             response.headers.setdefault("Access-Control-Allow-Methods", allow_methods)
             response.headers.setdefault("Access-Control-Allow-Headers", allow_headers)
             return response
+
+        return wrapped
+
+    return middleware
+
+
+def rate_limit_middleware(max_requests: int = 100, window_seconds: float = 60.0) -> Middleware:
+    """A sliding-window rate limiter, keyed by client IP.
+
+    Honest limitation, stated up front rather than left implicit: this is
+    in-memory and per-process. It resets if the server restarts, and
+    doesn't share state across multiple server processes/machines -- a
+    real production deployment behind a load balancer would need a shared
+    store (Redis, etc.) instead. Fine for a single-process demo server,
+    which is what this project is.
+    """
+    buckets: Dict[str, Deque[float]] = defaultdict(deque)
+    lock = threading.Lock()
+
+    def middleware(next_handler: Handler_) -> Handler_:
+        def wrapped(req: HTTPRequest) -> HTTPResponse:
+            client_ip = req.client_addr[0] if req.client_addr else "unknown"
+            now = time.monotonic()
+
+            with lock:
+                bucket = buckets[client_ip]
+                while bucket and now - bucket[0] > window_seconds:
+                    bucket.popleft()
+
+                if len(bucket) >= max_requests:
+                    retry_after = max(0.0, window_seconds - (now - bucket[0]))
+                    return HTTPResponse(
+                        status_code=429,
+                        headers={
+                            "Content-Type": "text/plain",
+                            "Retry-After": str(int(retry_after) + 1),
+                        },
+                        body=f"Too many requests -- try again in {int(retry_after) + 1}s\n".encode(),
+                    )
+
+                bucket.append(now)
+
+            return next_handler(req)
 
         return wrapped
 

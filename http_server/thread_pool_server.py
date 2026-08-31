@@ -25,9 +25,10 @@ import queue
 import socket
 import ssl
 import threading
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from .connection import Handler, handle_connection
+from .websocket import WSHandler
 
 TLS_HANDSHAKE_TIMEOUT_SECONDS = 10
 
@@ -41,6 +42,7 @@ class ThreadPoolHTTPServer:
         num_workers: int = 8,
         poll_interval: float = 0.5,
         ssl_context: Optional[ssl.SSLContext] = None,
+        ws_routes: Optional[Dict[str, WSHandler]] = None,
     ):
         if handler is None:
             raise ValueError("ThreadPoolHTTPServer requires a handler function")
@@ -50,6 +52,7 @@ class ThreadPoolHTTPServer:
         self.num_workers = num_workers
         self.poll_interval = poll_interval
         self.ssl_context = ssl_context
+        self.ws_routes = ws_routes
         self._queue: "queue.Queue" = queue.Queue()
         self._workers: List[threading.Thread] = []
         self._stop_event = threading.Event()
@@ -75,7 +78,7 @@ class ThreadPoolHTTPServer:
                     continue
 
             try:
-                handle_connection(conn, addr, self.handler)
+                handle_connection(conn, addr, self.handler, ws_routes=self.ws_routes)
             except Exception:
                 # A bug handling one connection must not kill this worker
                 # thread -- that would slowly shrink the pool over time.

@@ -3,22 +3,34 @@
 Owns the keep-alive loop: after each response, decides -- based on the
 request's HTTP version and Connection header -- whether to read another
 request off the same socket or close it.
+
+Phase 5 adds an optional WebSocket upgrade hook: if the request is a valid
+WebSocket handshake AND its path has a registered WS handler, this hands
+the raw socket off entirely to that handler (via WebSocketConnection) and
+the normal HTTP request/response loop never resumes on this connection.
 """
 from __future__ import annotations
 
 import socket
 import time
-from typing import Callable
+from typing import Callable, Dict, Optional
 
 from .parser import HTTPParseError, HTTPRequest, parse_request
 from .reader import BufferedSocketReader, ConnectionClosed, RequestTooLarge, SlowClientTimeout
 from .response import HeaderInjectionError, HTTPResponse, error_response
+from .websocket import (
+    WebSocketConnection,
+    WSHandler,
+    build_handshake_response,
+    is_websocket_upgrade_request,
+)
 
 MAX_REQUEST_LINE = 8192
 MAX_HEAD_SIZE = 64 * 1024  # request line + all headers combined
 MAX_BODY_SIZE = 10 * 1024 * 1024  # 10 MB -- generous placeholder
 IDLE_TIMEOUT_SECONDS = 30  # max time with ZERO bytes at all between reads
 MAX_REQUEST_READ_SECONDS = 10  # max WALL-CLOCK time to receive one whole request -- Slowloris defense
+WEBSOCKET_IDLE_TIMEOUT_SECONDS = 300  # generous -- WS connections are legitimately long-lived/idle
 
 Handler = Callable[[HTTPRequest], HTTPResponse]
 
@@ -31,7 +43,12 @@ def wants_keep_alive(req: HTTPRequest) -> bool:
     return req.version == "HTTP/1.1"
 
 
-def handle_connection(sock: socket.socket, addr, handler: Handler) -> None:
+def handle_connection(
+    sock: socket.socket,
+    addr,
+    handler: Handler,
+    ws_routes: Optional[Dict[str, WSHandler]] = None,
+) -> None:
     sock.settimeout(IDLE_TIMEOUT_SECONDS)
     reader = BufferedSocketReader(sock)
 
@@ -97,6 +114,12 @@ def handle_connection(sock: socket.socket, addr, handler: Handler) -> None:
 
             req.client_addr = addr
 
+            if ws_routes and req.path in ws_routes and is_websocket_upgrade_request(req):
+                # WebSocket upgrade requests never have a body -- go
+                # straight to the handshake, no Content-Length handling.
+                _handle_websocket_upgrade(sock, reader, req, ws_routes[req.path])
+                return  # this connection now belongs entirely to the WS handler
+
             content_length_header = req.header("content-length")
             if content_length_header is not None:
                 try:
@@ -153,6 +176,38 @@ def handle_connection(sock: socket.socket, addr, handler: Handler) -> None:
                 return
     finally:
         sock.close()
+
+
+def _handle_websocket_upgrade(
+    sock: socket.socket, reader: BufferedSocketReader, req: HTTPRequest, ws_handler: WSHandler
+) -> None:
+    handshake_response = build_handshake_response(req)
+    try:
+        sock.sendall(handshake_response.to_bytes())
+    except OSError:
+        return
+
+    # Any bytes the HTTP layer already read off the wire but hadn't
+    # consumed yet (e.g. the start of the client's first WS frame,
+    # delivered in the same TCP segment as the upgrade request) must be
+    # handed to the WebSocket layer too, not silently dropped.
+    leftover = reader.drain_buffered()
+
+    # WebSocket connections are long-lived by nature and legitimately sit
+    # idle between messages, so this can't reuse IDLE_TIMEOUT_SECONDS --
+    # but a generous timeout is still a worthwhile safety net against a
+    # connection that's actually dead rather than just quiet. A real
+    # production implementation would send periodic PING frames and treat
+    # a missed PONG as the actual liveness signal instead of relying on a
+    # timeout alone; that's a documented "next" item, not implemented here.
+    sock.settimeout(WEBSOCKET_IDLE_TIMEOUT_SECONDS)
+    ws_conn = WebSocketConnection(sock, initial_buffer=leftover)
+    try:
+        ws_handler(ws_conn, req)
+    except Exception:
+        pass  # a bug in the WS handler must not crash the server
+    finally:
+        ws_conn.close()
 
 
 def _send_and_close(sock: socket.socket, response: HTTPResponse) -> None:

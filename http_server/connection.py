@@ -21,7 +21,7 @@ IDLE_TIMEOUT_SECONDS = 30  # basic only; real Slowloris protection is Phase 4
 Handler = Callable[[HTTPRequest], HTTPResponse]
 
 
-def _wants_keep_alive(req: HTTPRequest) -> bool:
+def wants_keep_alive(req: HTTPRequest) -> bool:
     connection_header = (req.header("connection") or "").lower()
     if connection_header:
         return connection_header != "close"
@@ -107,7 +107,7 @@ def handle_connection(sock: socket.socket, addr, handler: Handler) -> None:
             except Exception as e:  # a bug in the handler must never take the server down
                 response = error_response(500, f"Internal server error: {e}")
 
-            keep_alive = _wants_keep_alive(req) and response.status_code < 500
+            keep_alive = wants_keep_alive(req) and response.status_code < 500
             response.headers.setdefault("Connection", "keep-alive" if keep_alive else "close")
 
             include_body = req.method != "HEAD"

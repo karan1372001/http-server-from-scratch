@@ -1,4 +1,4 @@
-# From-Scratch HTTP Server — Phase 2
+# From-Scratch HTTP Server — Phase 3
 
 A production-style HTTP/1.1 server built from raw TCP sockets, with no web
 framework (no FastAPI/Flask/Django). This is the companion piece to
@@ -6,65 +6,106 @@ framework (no FastAPI/Flask/Django). This is the companion piece to
 professional framework, this one shows I understand what the framework is
 actually doing underneath.
 
-## Phase 2 scope (this commit)
+## Phase 3 scope (this commit): two concurrency models, benchmarked honestly
 
-Everything from Phase 1, plus:
+Everything from Phase 1/2 was single-threaded: one connection fully handled
+(including its whole keep-alive lifetime) before the next was even accepted.
+Phase 3 adds two different concurrency models on top of the same request
+handling, and benchmarks them against each other and against the baseline
+-- not just describing the trade-offs, but proving them with real numbers.
 
-- **A real router** — matches path + method to a handler, including path
-  parameters (`/users/{id}`) and a catch-all form for static files
-  (`/static/{filepath*}`). Registering two methods on the same path (e.g.
-  `GET /items` and `POST /items`) works correctly, and a path that matches
-  but with the wrong method returns `405` with a proper `Allow` header,
-  not a `404`.
-- **Request body parsing**: JSON, `application/x-www-form-urlencoded`, and
-  `multipart/form-data` (real file uploads). The multipart parser is
-  hand-written — boundary detection, per-part headers, filename extraction —
-  since that's the genuinely tricky part of an HTTP server most people never
-  implement themselves. JSON/urlencoded use the standard library's own
-  data-format parsers (`json`, `urllib.parse`), which is different from
-  using a web *framework* — see the comment at the top of `body_parser.py`
-  for the reasoning.
-- **Static file serving** with real path-traversal protection: paths are
-  *resolved* against the served root first, then checked for containment —
-  not just string-checked for `"../"`, which is the naive version and is
-  easy to bypass. Verified live against a real attack attempt (see below).
-- **Custom HTML error pages** (404/405/etc.) via `errors.py`, separate from
-  the plain-text parse-level errors from Phase 1.
+- **Thread pool** (`thread_pool_server.py`) — a fixed pool of worker
+  threads pulls connections off a queue; each worker runs the same blocking
+  `handle_connection` used since Phase 1. Simple, and scales up to
+  `num_workers` connections actively in flight at once.
+- **Async / selectors** (`async_server.py` + `async_connection.py`) — a
+  single thread, non-blocking sockets, and Python's `selectors` module
+  (the same underlying mechanism — epoll/kqueue — behind nginx and
+  Node.js). This required a genuinely different implementation, not just a
+  wrapper: a non-blocking socket can deliver a request one byte at a time
+  across many separate `recv()` calls, so `async_connection.py` is a state
+  machine that accumulates bytes and only responds once a full request has
+  arrived, instead of connection.py's approach of just blocking until
+  enough bytes show up.
+
+### The benchmark (`benchmark.py`) — real results, not estimates
+
+20 concurrent requests fired at each server model, two scenarios:
+`GET /` (fast) and `GET /slow` (a demo endpoint that does `time.sleep(0.1)`
+to simulate an I/O-bound handler, like a slow database call).
+
+```
+model      scenario   time (s)
+----------------------------------------------
+single     /              0.01
+single     /slow          2.01
+threaded   /              0.01
+threaded   /slow          0.30
+async      /              0.01
+async      /slow          2.02
+```
+
+**Fast requests**: all three models are indistinguishable — the work per
+request is trivial, so there's nothing for any concurrency model to help
+with.
+
+**Slow requests, and the actually interesting result**: the thread pool
+gives a real ~6.7x speedup (2.01s → 0.30s, roughly what you'd expect from
+20 requests over 8 workers). The async server gives **zero** speedup
+(2.02s — statistically identical to the fully single-threaded baseline).
+
+That's not a bug — it's the honest, important limitation of this
+implementation, worth understanding rather than glossing over: the async
+server avoids per-connection *thread* overhead, but the handler function
+(`time.sleep(0.1)` in this case) still runs synchronously on the *one*
+event-loop thread. While it sleeps, the whole loop is blocked — every other
+connection, however unrelated, has to wait. This is the exact same
+limitation Node.js or any single-threaded event loop has with synchronous
+code. A truly async-fast version of `/slow` would need `async def` handlers
+using non-blocking primitives (`await asyncio.sleep(...)`, an async DB
+driver, etc.) — not blocking calls layered under a selectors loop, which is
+what this project intentionally built to make the limitation visible.
+
+**What each model is actually good for**, put plainly: the thread pool is
+the right tool when handlers do blocking work (which is most real
+handlers, including this one). The async model's real strength is holding
+large numbers of *idle or slow-to-send* connections cheaply — thousands of
+open sockets waiting on network I/O — without needing a thread per
+connection, which is a different axis entirely from the CPU/blocking-work
+scenario this benchmark measures. That's the C10K-style scaling case, and
+it's why real async frameworks pair the event loop with async-aware
+handler code rather than ordinary blocking functions.
 
 ## Project layout
 
 ```
 http_server/
-  reader.py        # buffered socket reader
-  parser.py        # raw bytes -> HTTPRequest
-  response.py       # HTTPResponse -> raw bytes
-  connection.py     # per-connection loop, keep-alive
-  server.py         # accept loop (still single-threaded -- Phase 3)
-  router.py         # NEW: path/method matching, path params, catch-all
-  body_parser.py    # NEW: JSON / form / multipart parsing
-  static_files.py   # NEW: safe static file serving
-  errors.py         # NEW: HTML error pages
-app.py              # demo app wired through the router
-public/             # sample static files served at /static/*
-run.py              # entry point
-tests/
-  test_parser.py, test_router.py, test_body_parser.py,
-  test_static_files.py, test_integration.py
+  reader.py            # buffered socket reader (blocking model)
+  parser.py            # raw bytes -> HTTPRequest
+  response.py          # HTTPResponse -> raw bytes
+  connection.py         # blocking per-connection loop, keep-alive
+  server.py             # single-threaded accept loop (Phase 1/2 baseline)
+  router.py             # path/method matching, path params, catch-all
+  body_parser.py         # JSON / form / multipart parsing
+  static_files.py        # safe static file serving
+  errors.py              # HTML error pages
+  thread_pool_server.py  # NEW: concurrency Model A
+  async_connection.py    # NEW: non-blocking request state machine
+  async_server.py         # NEW: concurrency Model B (selectors event loop)
+app.py                   # demo app, includes /slow for the benchmark
+benchmark.py              # NEW: compares all three models under load
+public/                  # sample static files served at /static/*
+run.py                   # entry point -- pick single/threaded/async
+tests/                   # 77 tests across every module
 ```
 
 ## Running it
 
 ```bash
-python run.py                  # listens on 127.0.0.1:8080
-```
-
-Try in a browser or with curl:
-
-```bash
-curl http://127.0.0.1:8080/users/1
-curl http://127.0.0.1:8080/static/hello.txt
-curl -X POST -d "name=Ada&role=engineer" http://127.0.0.1:8080/form
-curl -X POST -F "avatar=@somefile.txt" http://127.0.0.1:8080/upload
+python run.py 127.0.0.1 8080 single     # Phase 1/2 behavior (default)
+python run.py 127.0.0.1 8080 threaded   # thread pool, 8 workers
+python run.py 127.0.0.1 8080 async      # selectors event loop
+python benchmark.py                     # runs the comparison above
 ```
 
 ## Running the tests
@@ -74,64 +115,32 @@ pip install pytest
 python -m pytest -v
 ```
 
-**63 tests, all passing** — unit tests per module (router matching including
-catch-all and 405-vs-404 behavior; body parsing including malformed
-multipart input; static file serving including path-traversal attempts
-against a real temp directory) plus end-to-end integration tests that spin
-up the real server and hit it over an actual socket.
+**77 tests, all passing, zero warnings.** New in this phase:
+`test_thread_pool_server.py` proves genuine parallelism by timing (not just
+correctness) — concurrent slow requests must complete in a fraction of the
+serial-would-take time, or the test fails. `test_async_server.py` unit-tests
+the state machine directly against deliberately fragmented input (one byte
+at a time, split bodies, pipelined requests), plus integration tests
+including a real slow-client simulation over an actual socket.
 
-## Three real bugs this phase's testing caught
+## Previous bugs (Phase 1 & 2) — still documented for context
 
-1. **Multipart part-length test typo, not a code bug** — an integration
-   test asserted the wrong byte count for an uploaded file's size (miscounted
-   by 1). Worth naming honestly: this one was a test-authoring mistake, not
-   a server bug, and the fix was to assert against the computed length
-   instead of a hardcoded number.
-2. **Missing `403` status message** — a live manual test of the
-   path-traversal defense (see below) showed the response as `403 Unknown`
-   instead of `403 Forbidden`, because `403` was never added to the
-   status-message table in `response.py`, even though the code was already
-   returning the right status *code*. Easy to miss with unit tests alone
-   (they check `status_code`, not the rendered reason phrase) — caught by
-   actually looking at the raw bytes a browser would receive.
-3. **Shutdown race between threads, and it's platform-dependent** — running
-   the test suite on Windows surfaced a background-thread crash during
-   teardown (`AttributeError: 'NoneType' object has no attribute 'close'`):
-   closing the listening socket from the main thread while the server's own
-   thread was blocked inside `accept()` raced against that thread's own
-   cleanup code. The first fix attempt (catch the exception `accept()`
-   raises when its socket gets closed) turned out to be platform-dependent
-   in the wrong direction: it worked on Windows but a follow-up test showed
-   that on Linux, closing a socket that another thread is blocked on
-   `accept()` for often doesn't interrupt it at all -- it just hangs
-   forever, since POSIX leaves that behavior undefined. The real fix was to
-   stop depending on that entirely: the listening socket now gets a short
-   timeout, so `accept()` wakes up periodically on its own to check a stop
-   flag, and only the thread that owns the socket ever closes it. Verified
-   with a dedicated regression test (`test_server_shutdown.py`) that starts
-   a server, closes it mid-`accept()`, and asserts the thread exits cleanly
-   with no exception.
-
-## Verified live: the path-traversal defense actually works
-
-Manually attacked the running server with:
-
-```
-GET /static/../app.py HTTP/1.1
-```
-
-— an attempt to escape the `public/` folder and read the server's own
-source code (which contains the fake user data, so a leak would be obvious).
-Result: `403 Forbidden`, no file contents returned. This is what
-"resolve first, then check containment" (see `static_files.py`) is for —
-checking the raw URL string for `"../"` before resolving is the naive
-version and is easier to bypass.
+1. **Zero-headers parsing bug** (Phase 1) — reading the request line and
+   headers as two separate delimited reads broke for a request with no
+   headers at all. Fixed by reading the whole head as one block and
+   splitting it afterward.
+2. **Missing `403` status message** (Phase 2) — path-traversal defense
+   returned the right status *code* but rendered as `403 Unknown` because
+   `403` was missing from the status-message table.
+3. **Shutdown race, and it's platform-dependent** (Phase 2) — closing the
+   listening socket from another thread while `accept()` was blocked raised
+   on Windows but silently hung forever on Linux. Fixed by using a
+   short-timeout-plus-stop-flag design instead of depending on that
+   undefined behavior.
 
 ## What's next
 
-- **Phase 3** — two concurrency models (thread pool vs. async event loop via
-  `selectors`), benchmarked against each other
 - **Phase 4** — TLS, middleware pipeline, caching headers, range requests,
-  request-size limits, connection timeouts, access logging
+  request-size limits, structured access logging
 - **Phase 5** (stretch) — WebSockets, rate limiting, reverse-proxy mode
 - **Phase 6** — load-test benchmarks vs. nginx/uvicorn, Docker, CI, final README

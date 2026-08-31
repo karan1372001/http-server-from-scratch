@@ -5,6 +5,7 @@ http_server/router.py.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 from http_server.body_parser import BodyParseError, parse_body
@@ -89,6 +90,15 @@ def upload_files(req: HTTPRequest) -> HTTPResponse:
 @router.get("/static/{filepath*}")
 def static_file(req: HTTPRequest) -> HTTPResponse:
     return serve_static_file(STATIC_ROOT, req.path_params["filepath"])
+
+
+@router.get("/slow")
+def slow(req: HTTPRequest) -> HTTPResponse:
+    """Simulates an I/O-bound handler (e.g. a slow database call), purely
+    for the Phase 3 concurrency benchmark -- see README.md Phase 3.
+    """
+    time.sleep(0.1)
+    return make_response(200, b"Slow response after ~100ms\n", {"Content-Type": "text/plain"})
 
 
 app_handler = router.as_handler()

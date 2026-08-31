@@ -20,6 +20,7 @@ STATUS_MESSAGES: Dict[int, str] = {
     411: "Length Required",
     413: "Payload Too Large",
     414: "URI Too Long",
+    416: "Range Not Satisfiable",
     431: "Request Header Fields Too Large",
     500: "Internal Server Error",
     501: "Not Implemented",
@@ -27,9 +28,27 @@ STATUS_MESSAGES: Dict[int, str] = {
 }
 
 
+class HeaderInjectionError(Exception):
+    """Raised when a response header contains an illegal control character.
+
+    This is the OUTGOING half of the same defense parser.py applies to
+    incoming headers. Even though our own code builds these headers, a
+    handler that reflects request data into a response header (an Etag
+    built from a client-supplied value, a redirect Location built from a
+    query param, etc.) could otherwise let an attacker smuggle a fake
+    extra header or split the response into two -- classic HTTP response
+    splitting. Refusing to serialize it at all, rather than trying to
+    silently sanitize it, makes the bug impossible to miss in testing.
+    """
+
+
 def http_date(dt: Optional[datetime.datetime] = None) -> str:
     dt = dt or datetime.datetime.now(datetime.timezone.utc)
     return dt.strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+
+def http_date_from_timestamp(ts: float) -> str:
+    return http_date(datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc))
 
 
 @dataclass
@@ -44,6 +63,14 @@ class HTTPResponse:
         headers.setdefault("Date", http_date())
         headers.setdefault("Server", "FromScratchHTTP/0.1")
         headers.setdefault("Content-Length", str(len(self.body)))
+
+        for key, value in headers.items():
+            if any(c in key or c in str(value) for c in ("\r", "\n", "\x00")):
+                raise HeaderInjectionError(
+                    f"Refusing to send header {key!r} -- its value contains an illegal "
+                    "control character, which is exactly what a header-injection / "
+                    "response-splitting attack looks like."
+                )
 
         lines = [f"{http_version} {self.status_code} {reason}"]
         lines += [f"{k}: {v}" for k, v in headers.items()]

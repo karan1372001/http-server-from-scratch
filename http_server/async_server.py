@@ -29,7 +29,7 @@ import time
 from typing import Optional
 
 from .async_connection import AsyncConnection
-from .connection import IDLE_TIMEOUT_SECONDS, Handler
+from .connection import IDLE_TIMEOUT_SECONDS, MAX_REQUEST_READ_SECONDS, Handler
 
 
 class AsyncHTTPServer:
@@ -90,7 +90,7 @@ class AsyncHTTPServer:
         except OSError:
             return  # spurious wakeup -- nothing actually ready
         conn.setblocking(False)
-        state = AsyncConnection(self.handler)
+        state = AsyncConnection(self.handler, addr=addr)
         self._sel.register(conn, selectors.EVENT_READ, data=state)
 
     def _service(self, key: "selectors.SelectorKey", mask: int) -> None:
@@ -156,5 +156,22 @@ class AsyncHTTPServer:
             state = key.data
             if state is None:
                 continue  # the listening socket itself
+
+            if state.is_receiving_request and state.request_in_progress_seconds > MAX_REQUEST_READ_SECONDS:
+                # Async equivalent of connection.py's SlowClientTimeout: this
+                # connection has been trickling in one request for too long
+                # (the actual Slowloris defense -- distinct from plain
+                # idleness, which last_active/IDLE_TIMEOUT_SECONDS covers
+                # below). Fail it with 408 and make sure that response
+                # actually gets flushed by switching this socket to expect
+                # a write.
+                state.fail_with_timeout()
+                if state.wants_write:
+                    try:
+                        self._sel.modify(key.fileobj, selectors.EVENT_READ | selectors.EVENT_WRITE, data=state)
+                    except (KeyError, ValueError):
+                        pass
+                continue
+
             if now - state.last_active > IDLE_TIMEOUT_SECONDS:
                 self._close_connection(key.fileobj)

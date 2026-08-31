@@ -9,20 +9,20 @@ and only produces a response once a complete request has actually arrived.
 
 It intentionally reuses the exact same parsing rules as connection.py (read
 the whole head as one block, then split it -- the fix for the zero-headers
-edge case from Phase 1 applies here unchanged) and the exact same
-keep-alive decision (`wants_keep_alive`, imported from connection.py) rather
-than re-deriving either, so the two concurrency models can't quietly drift
-into different HTTP behavior.
+edge case from Phase 1 applies here unchanged), the same keep-alive decision
+(`wants_keep_alive`), and the same fail-safe handling of a header-injection
+attempt in an outgoing response, rather than re-deriving any of them, so the
+concurrency models can't quietly drift into different HTTP behavior.
 """
 from __future__ import annotations
 
 import time
 from enum import Enum, auto
-from typing import Optional
+from typing import Optional, Tuple
 
 from .connection import MAX_BODY_SIZE, MAX_HEAD_SIZE, MAX_REQUEST_LINE, Handler, wants_keep_alive
 from .parser import HTTPParseError, HTTPRequest, parse_request
-from .response import error_response
+from .response import HeaderInjectionError, error_response
 
 
 class _State(Enum):
@@ -35,8 +35,9 @@ class _State(Enum):
 class AsyncConnection:
     """Tracks parsing/response state for one non-blocking socket connection."""
 
-    def __init__(self, handler: Handler):
+    def __init__(self, handler: Handler, addr: Optional[Tuple[str, int]] = None):
         self.handler = handler
+        self.addr = addr
         self._state = _State.READING_HEAD
         self._read_buf = bytearray()
         self._write_buf = bytearray()
@@ -46,6 +47,13 @@ class AsyncConnection:
         self._http_version = "HTTP/1.1"
         self.should_close = False
         self.last_active = time.monotonic()
+        # Tracks how long the CURRENT in-progress request has been arriving,
+        # for the same Slowloris-style defense connection.py applies via a
+        # read deadline -- see request_in_progress_seconds and the sweep in
+        # async_server.py, which is what actually enforces this for the
+        # async model (a per-connection state machine has no loop of its
+        # own to check a deadline against; the server's event loop does).
+        self._request_started_at = time.monotonic()
 
     @property
     def wants_write(self) -> bool:
@@ -54,6 +62,26 @@ class AsyncConnection:
     @property
     def is_closed(self) -> bool:
         return self._state == _State.CLOSED
+
+    @property
+    def request_in_progress_seconds(self) -> float:
+        """How long the CURRENT request has been arriving. Only meaningful
+        while actively reading a head/body; the server's idle sweep should
+        only apply this check in that state, not while idle between
+        keep-alive requests (that's what last_active / IDLE_TIMEOUT is for).
+        """
+        return time.monotonic() - self._request_started_at
+
+    @property
+    def is_receiving_request(self) -> bool:
+        return self._state in (_State.READING_HEAD, _State.READING_BODY)
+
+    def fail_with_timeout(self) -> None:
+        """Called by the server's idle sweep when this connection has spent
+        too long sending a single request -- the async equivalent of
+        connection.py's SlowClientTimeout -> 408 response.
+        """
+        self._fail(408, "Request took too long to send")
 
     def feed(self, data: bytes) -> None:
         """Call with newly-received bytes. May advance internal state and,
@@ -91,6 +119,7 @@ class AsyncConnection:
         self._state = _State.READING_HEAD
         self._content_length = None
         self._req = None
+        self._request_started_at = time.monotonic()
         if self._read_buf:
             self._try_parse_head()
 
@@ -134,6 +163,7 @@ class AsyncConnection:
             self._fail(e.status_code, e.message)
             return
 
+        self._req.client_addr = self.addr
         self._http_version = self._req.version
         self._body_start_index = body_start
 
@@ -177,8 +207,16 @@ class AsyncConnection:
         response.headers.setdefault("Connection", "keep-alive" if keep_alive else "close")
         include_body = self._req.method != "HEAD"
 
-        self._write_buf.extend(
-            response.to_bytes(include_body=include_body, http_version=self._http_version)
-        )
+        try:
+            response_bytes = response.to_bytes(include_body=include_body, http_version=self._http_version)
+        except HeaderInjectionError:
+            # Same fail-safe as connection.py: never let an injected header
+            # reach the wire, even if it means downgrading to a plain 500.
+            safe = error_response(500, "Internal server error: invalid response header")
+            safe.headers["Connection"] = "close"
+            response_bytes = safe.to_bytes()
+            keep_alive = False
+
+        self._write_buf.extend(response_bytes)
         self.should_close = not keep_alive
         self._state = _State.WRITING

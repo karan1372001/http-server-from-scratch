@@ -10,6 +10,7 @@ from pathlib import Path
 
 from http_server.body_parser import BodyParseError, parse_body
 from http_server.errors import error_page
+from http_server.middleware import access_log_middleware, apply_middleware, cors_middleware, gzip_middleware
 from http_server.parser import HTTPRequest
 from http_server.response import HTTPResponse, make_response
 from http_server.router import Router
@@ -89,7 +90,7 @@ def upload_files(req: HTTPRequest) -> HTTPResponse:
 
 @router.get("/static/{filepath*}")
 def static_file(req: HTTPRequest) -> HTTPResponse:
-    return serve_static_file(STATIC_ROOT, req.path_params["filepath"])
+    return serve_static_file(STATIC_ROOT, req.path_params["filepath"], req)
 
 
 @router.get("/slow")
@@ -101,4 +102,7 @@ def slow(req: HTTPRequest) -> HTTPResponse:
     return make_response(200, b"Slow response after ~100ms\n", {"Content-Type": "text/plain"})
 
 
-app_handler = router.as_handler()
+app_handler = apply_middleware(
+    router.as_handler(),
+    [access_log_middleware(), cors_middleware(), gzip_middleware()],
+)

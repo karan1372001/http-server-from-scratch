@@ -16,14 +16,22 @@ undefined, platform-dependent behavior, not something to depend on.
 Instead, the listening socket gets a short timeout, so accept() returns
 (with a timeout exception, not a real connection) periodically on its own,
 letting the loop check a stop flag and exit cleanly on every platform.
+
+Phase 4 adds optional TLS: pass an `ssl.SSLContext` and every accepted
+connection is wrapped with it before being handed to handle_connection,
+which doesn't need to know or care -- an SSLSocket exposes the same
+recv()/sendall()/settimeout() interface as a plain socket.
 """
 from __future__ import annotations
 
 import socket
+import ssl
 import threading
 from typing import Optional
 
 from .connection import Handler, handle_connection
+
+TLS_HANDSHAKE_TIMEOUT_SECONDS = 10
 
 
 class HTTPServer:
@@ -33,6 +41,7 @@ class HTTPServer:
         port: int = 8080,
         handler: Optional[Handler] = None,
         poll_interval: float = 0.5,
+        ssl_context: Optional[ssl.SSLContext] = None,
     ):
         if handler is None:
             raise ValueError("HTTPServer requires a handler function")
@@ -40,6 +49,7 @@ class HTTPServer:
         self.port = port
         self.handler = handler
         self.poll_interval = poll_interval
+        self.ssl_context = ssl_context
         self._sock: Optional[socket.socket] = None
         self._stop_event = threading.Event()
 
@@ -51,7 +61,9 @@ class HTTPServer:
         sock.settimeout(self.poll_interval)
         self._sock = sock
         self._stop_event.clear()
-        print(f"Listening on http://{self.host}:{self.port} (single-threaded, Phase 1)")
+
+        scheme = "https" if self.ssl_context else "http"
+        print(f"Listening on {scheme}://{self.host}:{self.port} (single-threaded, Phase 1)")
 
         try:
             while not self._stop_event.is_set():
@@ -59,6 +71,20 @@ class HTTPServer:
                     conn, addr = sock.accept()
                 except socket.timeout:
                     continue  # no connection yet -- loop back and re-check the stop flag
+
+                if self.ssl_context is not None:
+                    conn.settimeout(TLS_HANDSHAKE_TIMEOUT_SECONDS)
+                    try:
+                        conn = self.ssl_context.wrap_socket(conn, server_side=True)
+                    except (ssl.SSLError, OSError):
+                        # A bad/incomplete handshake must not take the
+                        # server down -- just drop this one connection.
+                        try:
+                            conn.close()
+                        except OSError:
+                            pass
+                        continue
+
                 # handle_connection sets its own timeout on `conn` immediately,
                 # so it doesn't inherit this short listening-socket timeout.
                 handle_connection(conn, addr, self.handler)

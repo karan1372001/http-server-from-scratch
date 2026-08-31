@@ -7,16 +7,18 @@ request off the same socket or close it.
 from __future__ import annotations
 
 import socket
+import time
 from typing import Callable
 
 from .parser import HTTPParseError, HTTPRequest, parse_request
-from .reader import BufferedSocketReader, ConnectionClosed, RequestTooLarge
-from .response import HTTPResponse, error_response
+from .reader import BufferedSocketReader, ConnectionClosed, RequestTooLarge, SlowClientTimeout
+from .response import HeaderInjectionError, HTTPResponse, error_response
 
 MAX_REQUEST_LINE = 8192
 MAX_HEAD_SIZE = 64 * 1024  # request line + all headers combined
-MAX_BODY_SIZE = 10 * 1024 * 1024  # 10 MB -- generous placeholder for Phase 1
-IDLE_TIMEOUT_SECONDS = 30  # basic only; real Slowloris protection is Phase 4
+MAX_BODY_SIZE = 10 * 1024 * 1024  # 10 MB -- generous placeholder
+IDLE_TIMEOUT_SECONDS = 30  # max time with ZERO bytes at all between reads
+MAX_REQUEST_READ_SECONDS = 10  # max WALL-CLOCK time to receive one whole request -- Slowloris defense
 
 Handler = Callable[[HTTPRequest], HTTPResponse]
 
@@ -35,6 +37,14 @@ def handle_connection(sock: socket.socket, addr, handler: Handler) -> None:
 
     try:
         while True:
+            # Fresh deadline per REQUEST, not per connection -- a keep-alive
+            # connection is allowed to sit idle between requests (up to
+            # IDLE_TIMEOUT_SECONDS), but once a client starts sending one, it
+            # has to actually finish sending it within this window. See
+            # SlowClientTimeout in reader.py for why this needs to be a
+            # separate check from the socket's own per-call timeout.
+            deadline = time.monotonic() + MAX_REQUEST_READ_SECONDS
+
             # Read the whole head (request line + all headers) as one block,
             # up to the blank line that separates it from the body. Splitting
             # it AFTER reading -- rather than reading the request line and
@@ -43,11 +53,14 @@ def handle_connection(sock: socket.socket, addr, handler: Handler) -> None:
             # blank line's CRLF don't add up to a clean "\r\n\r\n" once the
             # request line has already been consumed separately.
             try:
-                head = reader.read_until(b"\r\n\r\n", max_size=MAX_HEAD_SIZE)
+                head = reader.read_until(b"\r\n\r\n", max_size=MAX_HEAD_SIZE, deadline=deadline)
             except ConnectionClosed:
                 return  # peer closed between requests -- normal on keep-alive
             except socket.timeout:
                 return  # idle too long -- close quietly
+            except SlowClientTimeout:
+                _send_and_close(sock, error_response(408, "Request took too long to send"))
+                return
             except RequestTooLarge:
                 _send_and_close(sock, error_response(431, "Request head too large"))
                 return
@@ -57,8 +70,11 @@ def handle_connection(sock: socket.socket, addr, handler: Handler) -> None:
                 # keep-alive requests (allowed by spec as a lenient-parsing
                 # courtesy, RFC 7230 3.5) -- skip it and read the real head.
                 try:
-                    head = reader.read_until(b"\r\n\r\n", max_size=MAX_HEAD_SIZE)
+                    head = reader.read_until(b"\r\n\r\n", max_size=MAX_HEAD_SIZE, deadline=deadline)
                 except (ConnectionClosed, socket.timeout):
+                    return
+                except SlowClientTimeout:
+                    _send_and_close(sock, error_response(408, "Request took too long to send"))
                     return
                 except RequestTooLarge:
                     _send_and_close(sock, error_response(431, "Request head too large"))
@@ -79,6 +95,8 @@ def handle_connection(sock: socket.socket, addr, handler: Handler) -> None:
                 _send_and_close(sock, error_response(e.status_code, e.message))
                 return
 
+            req.client_addr = addr
+
             content_length_header = req.header("content-length")
             if content_length_header is not None:
                 try:
@@ -94,8 +112,11 @@ def handle_connection(sock: socket.socket, addr, handler: Handler) -> None:
                     return
 
                 try:
-                    req.body = reader.read_exact(content_length)
+                    req.body = reader.read_exact(content_length, deadline=deadline)
                 except (ConnectionClosed, socket.timeout):
+                    return
+                except SlowClientTimeout:
+                    _send_and_close(sock, error_response(408, "Request took too long to send"))
                     return
             elif "transfer-encoding" in req.headers:
                 # Chunked transfer-encoding is out of scope for Phase 1.
@@ -112,7 +133,19 @@ def handle_connection(sock: socket.socket, addr, handler: Handler) -> None:
 
             include_body = req.method != "HEAD"
             try:
-                sock.sendall(response.to_bytes(include_body=include_body, http_version=req.version))
+                response_bytes = response.to_bytes(include_body=include_body, http_version=req.version)
+            except HeaderInjectionError:
+                # A handler (or middleware) tried to send a header value
+                # with illegal control characters in it -- almost certainly
+                # unsanitized user input being reflected back. Never let
+                # that reach the wire; fail safe with a plain 500 instead.
+                safe = error_response(500, "Internal server error: invalid response header")
+                safe.headers["Connection"] = "close"
+                response_bytes = safe.to_bytes()
+                keep_alive = False
+
+            try:
+                sock.sendall(response_bytes)
             except OSError:
                 return
 

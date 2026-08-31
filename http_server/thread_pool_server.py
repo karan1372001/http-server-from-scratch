@@ -13,15 +13,23 @@ thread has real OS overhead (memory, context-switch cost), so this doesn't
 scale to thousands of concurrent connections the way Model B (async,
 selectors) can. See async_server.py and README.md Phase 3 for that trade-off
 in the other direction.
+
+Phase 4 adds optional TLS. The handshake happens inside the WORKER thread,
+not the accept loop -- a slow/malicious TLS handshake blocking one worker
+must not stall the accept loop from handing off other connections to the
+other workers.
 """
 from __future__ import annotations
 
 import queue
 import socket
+import ssl
 import threading
 from typing import List, Optional
 
 from .connection import Handler, handle_connection
+
+TLS_HANDSHAKE_TIMEOUT_SECONDS = 10
 
 
 class ThreadPoolHTTPServer:
@@ -32,6 +40,7 @@ class ThreadPoolHTTPServer:
         handler: Optional[Handler] = None,
         num_workers: int = 8,
         poll_interval: float = 0.5,
+        ssl_context: Optional[ssl.SSLContext] = None,
     ):
         if handler is None:
             raise ValueError("ThreadPoolHTTPServer requires a handler function")
@@ -40,6 +49,7 @@ class ThreadPoolHTTPServer:
         self.handler = handler
         self.num_workers = num_workers
         self.poll_interval = poll_interval
+        self.ssl_context = ssl_context
         self._queue: "queue.Queue" = queue.Queue()
         self._workers: List[threading.Thread] = []
         self._stop_event = threading.Event()
@@ -51,6 +61,19 @@ class ThreadPoolHTTPServer:
                 conn, addr = self._queue.get(timeout=self.poll_interval)
             except queue.Empty:
                 continue
+
+            if self.ssl_context is not None:
+                conn.settimeout(TLS_HANDSHAKE_TIMEOUT_SECONDS)
+                try:
+                    conn = self.ssl_context.wrap_socket(conn, server_side=True)
+                except (ssl.SSLError, OSError):
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+                    self._queue.task_done()
+                    continue
+
             try:
                 handle_connection(conn, addr, self.handler)
             except Exception:
@@ -78,8 +101,9 @@ class ThreadPoolHTTPServer:
         for w in self._workers:
             w.start()
 
+        scheme = "https" if self.ssl_context else "http"
         print(
-            f"Listening on http://{self.host}:{self.port} "
+            f"Listening on {scheme}://{self.host}:{self.port} "
             f"(thread pool, {self.num_workers} workers, Phase 3)"
         )
 

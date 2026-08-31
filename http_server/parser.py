@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote, parse_qs
 
 
@@ -30,6 +30,7 @@ class HTTPRequest:
     headers: Dict[str, str]  # lower-cased header names -> value
     body: bytes
     path_params: Dict[str, str] = field(default_factory=dict)
+    client_addr: Optional[Tuple[str, int]] = None
 
     def header(self, name: str, default=None):
         return self.headers.get(name.lower(), default)
@@ -99,6 +100,14 @@ def parse_headers(raw: bytes) -> Dict[str, str]:
 
         if not name_s or " " in name_s or "\t" in name_s:
             raise HTTPParseError(400, "Malformed header name")
+
+        # Defense against header/request smuggling: a LONE \r or \n (one
+        # without its pair) doesn't get caught by splitting on the full
+        # "\r\n" sequence above, and would otherwise sail through as a
+        # normal-looking ASCII value while secretly embedding what looks
+        # like extra header lines. Reject it outright, along with NUL.
+        if any(c in name_s or c in value_s for c in ("\r", "\n", "\x00")):
+            raise HTTPParseError(400, "Header contains illegal control characters")
 
         headers[name_s.lower()] = value_s
 

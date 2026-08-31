@@ -11,6 +11,8 @@ recv() can return the start of request 2 while we're still parsing request 1).
 from __future__ import annotations
 
 import socket
+import time
+from typing import Optional
 
 
 class ConnectionClosed(Exception):
@@ -19,6 +21,18 @@ class ConnectionClosed(Exception):
 
 class RequestTooLarge(Exception):
     """Raised when a request exceeds configured size limits."""
+
+
+class SlowClientTimeout(Exception):
+    """Raised when a read exceeds an overall wall-clock deadline.
+
+    This is distinct from the socket's own per-call timeout. A per-call
+    timeout alone doesn't stop a Slowloris-style attacker sending one byte
+    every few seconds forever -- each individual recv() succeeds well
+    within its own timeout, so the per-call clock keeps resetting and never
+    fires. A deadline that covers the WHOLE read (checked before every
+    individual recv() attempt) catches that instead.
+    """
 
 
 class BufferedSocketReader:
@@ -33,19 +47,23 @@ class BufferedSocketReader:
             raise ConnectionClosed()
         self._buf += chunk
 
-    def read_until(self, delimiter: bytes, max_size: int) -> bytes:
+    def read_until(self, delimiter: bytes, max_size: int, deadline: Optional[float] = None) -> bytes:
         """Read and consume up to and including delimiter; return the bytes before it."""
         while delimiter not in self._buf:
             if len(self._buf) > max_size:
                 raise RequestTooLarge()
+            if deadline is not None and time.monotonic() > deadline:
+                raise SlowClientTimeout()
             self._fill()
         idx = self._buf.index(delimiter)
         result = self._buf[:idx]
         self._buf = self._buf[idx + len(delimiter):]
         return result
 
-    def read_exact(self, n: int) -> bytes:
+    def read_exact(self, n: int, deadline: Optional[float] = None) -> bytes:
         while len(self._buf) < n:
+            if deadline is not None and time.monotonic() > deadline:
+                raise SlowClientTimeout()
             self._fill()
         result = self._buf[:n]
         self._buf = self._buf[n:]

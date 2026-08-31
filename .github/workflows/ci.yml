@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: Run test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pytest
+        run: pip install pytest
+
+      # TLS tests need openssl to generate a test certificate -- present by
+      # default on ubuntu-latest runners, installed explicitly anyway so
+      # this doesn't silently start skipping if that ever changes.
+      - name: Ensure openssl is available
+        run: openssl version || sudo apt-get update && sudo apt-get install -y openssl
+
+      - name: Run tests
+        run: python -m pytest -v
+
+  docker-build:
+    name: Verify Docker image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t from-scratch-http-server .
+
+      - name: Smoke test the built image
+        run: |
+          docker run -d -p 8080:8080 --name smoke from-scratch-http-server
+          sleep 2
+          curl -f http://127.0.0.1:8080/ || (docker logs smoke && exit 1)
+          docker stop smoke
